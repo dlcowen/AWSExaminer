@@ -1,0 +1,10 @@
+# AWS SDK
+boto3>=1.26.0
+botocore>=1.29.0
+
+# GUI Framework
+PySide6>=6.4.0
+
+# Data Processing (for Excel export)
+pandas>=1.5.0
+openpyxl>=3.0.0  # Required for Excel support in pandas 
