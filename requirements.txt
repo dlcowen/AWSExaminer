@@ -1,17 +1,10 @@
 # AWS SDK
-boto3>=1.34.0
-botocore>=1.34.0
+boto3>=1.26.0
+botocore>=1.29.0
 
 # GUI Framework
-PySide6>=6.6.0
-PyQt6-sip>=13.6.0  # Required by PySide6
+PySide6>=6.4.0
 
 # Data Processing (for Excel export)
-pandas>=2.1.0
-openpyxl>=3.1.0  # Required for Excel support in pandas
-numpy>=1.24.0    # Required by pandas
-
-# Development Tools (optional)
-black>=23.12.0   # Code formatting
-pylint>=3.0.0    # Code linting
-pytest>=7.4.0    # Testing 
+pandas>=1.5.0
+openpyxl>=3.0.10  # Required for Excel export 

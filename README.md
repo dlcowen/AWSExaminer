@@ -10,12 +10,42 @@ A Python-based GUI tool for enumerating and analyzing AWS resources across multi
   - Role assumption for cross-account access
   - Parallel scanning of multiple accounts
 - Support for multiple resource types:
-  - EC2 Instances
-  - EBS Volumes
-  - EC2 Snapshots
+  - EC2 Instances:
+    - Instance type and state
+    - Private and public IP addresses
+    - SSH key names
+    - Platform details
+    - VPC and subnet information
+    - Launch time
+  - EBS Volumes:
+    - Volume size and type
+    - Encryption status
+    - IOPS and throughput
+    - Attachment information
+  - EC2 Snapshots:
+    - Size and creation date
+    - Source volume and instance
+    - Encryption status
+    - Description and state
   - Security Groups
   - S3 Buckets
   - RDS Instances
+  - CloudWatch Logs:
+    - Log group names
+    - Storage size
+    - Retention periods
+  - CloudTrail:
+    - Organization-wide trail detection
+    - Trail status and configuration
+    - S3 bucket destinations
+  - VPC Flow Logs:
+    - Destination paths (S3/CloudWatch)
+    - Retention periods
+    - Status and configuration
+  - Lightsail:
+    - Instances
+    - Databases
+    - Load Balancers
 - Real-time progress tracking:
   - Overall account progress
   - Current account progress
@@ -31,6 +61,10 @@ A Python-based GUI tool for enumerating and analyzing AWS resources across multi
   - Parallel region scanning
   - Concurrent account processing
   - Progress tracking across all operations
+- Enhanced data visualization:
+  - Color-coded status indicators
+  - Hierarchical resource views
+  - Detailed metadata display
 
 ## Installation
 
@@ -70,9 +104,10 @@ python aws_enumerator.py
 4. Browse resources:
    - By account
    - By region
-   - View resource counts at each level
+   - View resource counts and details
+   - Inspect detailed metadata
 
-5. Export results using the Export button in the toolbar:
+5. Export results using the Export Inventory button in the toolbar:
    - Text: Human-readable format
    - JSON: Structured data format
    - Excel: Spreadsheet with summary and detailed sheets
@@ -98,10 +133,18 @@ The AWS credentials used should have the following permissions:
 - `ec2:DescribeVolumes`
 - `ec2:DescribeSnapshots`
 - `ec2:DescribeSecurityGroups`
+- `ec2:DescribeFlowLogs`
 - `s3:ListBuckets`
 - `s3:GetBucketLocation`
 - `rds:DescribeDBInstances`
+- `logs:DescribeLogGroups`
+- `cloudtrail:DescribeTrails`
+- `cloudtrail:GetTrailStatus`
+- `cloudtrail:GetTrail`
 - `sts:GetCallerIdentity`
+- `lightsail:GetInstances`
+- `lightsail:GetRelationalDatabases`
+- `lightsail:GetLoadBalancers`
 
 For scanning organization member accounts, the OrganizationAccountAccessRole (or equivalent) must be present in member accounts.
 
@@ -111,6 +154,7 @@ The tool uses Python's multiprocessing to scan regions and accounts in parallel:
 - Number of parallel processes is based on CPU cores
 - Progress tracking across all parallel operations
 - Memory-efficient resource collection
+- Automatic retry with exponential backoff for API calls
 
 ## License
 
