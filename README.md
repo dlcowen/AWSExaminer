@@ -1,10 +1,14 @@
 # AWS Resource Enumerator
 
-A Python-based GUI tool for enumerating and analyzing AWS resources across all regions in an AWS account. This tool helps security professionals, incident responders, and cloud administrators quickly gather and analyze AWS resource information.
+A Python-based GUI tool for enumerating and analyzing AWS resources across multiple accounts and regions. This tool helps security professionals, incident responders, and cloud administrators quickly gather and analyze AWS resource information across an entire AWS Organization.
 
 ## Features
 
 - Enumerate AWS resources across all regions
+- Support for AWS Organizations:
+  - Automatic discovery of member accounts
+  - Role assumption for cross-account access
+  - Parallel scanning of multiple accounts
 - Support for multiple resource types:
   - EC2 Instances
   - EBS Volumes
@@ -12,20 +16,27 @@ A Python-based GUI tool for enumerating and analyzing AWS resources across all r
   - Security Groups
   - S3 Buckets
   - RDS Instances
-- Real-time progress tracking
+- Real-time progress tracking:
+  - Overall account progress
+  - Current account progress
+  - Region-specific progress
 - Multiple authentication methods:
   - AWS Profile
   - Direct API Key input
 - Export capabilities:
   - Text format (as displayed)
   - JSON format
-  - Excel spreadsheet (with summary)
+  - Excel spreadsheet (with summary and detailed sheets)
+- Multi-processing support:
+  - Parallel region scanning
+  - Concurrent account processing
+  - Progress tracking across all operations
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-ne https://github.com/yourusername/aws-resource-enumerator.git
+git clone https://github.com/yourusername/aws-resource-enumerator.git
 cd aws-resource-enumerator
 ```
 
@@ -51,9 +62,15 @@ python aws_enumerator.py
    - **AWS Profile**: Choose an existing profile from your AWS credentials file
    - **API Key**: Enter your AWS Access Key ID and Secret Access Key
 
-3. Wait for the enumeration to complete (progress will be displayed)
+3. Wait for the enumeration to complete:
+   - Progress bars show scanning status
+   - Log window displays detailed information
+   - Resource tree updates as data is collected
 
-4. Browse resources by region in the left panel
+4. Browse resources:
+   - By account
+   - By region
+   - View resource counts at each level
 
 5. Export results using the Export button in the toolbar:
    - Text: Human-readable format
@@ -68,11 +85,15 @@ The tool supports two methods of AWS authentication:
 2. **Direct API Keys**: Allows input of Access Key ID and Secret Access Key
    - Option to save credentials as a new profile
 
-Ensure your AWS credentials have appropriate permissions to list resources in your account.
+For AWS Organizations support, ensure your credentials have appropriate permissions to:
+- List organization accounts
+- Assume roles in member accounts
 
 ## Required Permissions
 
 The AWS credentials used should have the following permissions:
+- `organizations:ListAccounts`
+- `sts:AssumeRole`
 - `ec2:DescribeInstances`
 - `ec2:DescribeVolumes`
 - `ec2:DescribeSnapshots`
@@ -81,6 +102,15 @@ The AWS credentials used should have the following permissions:
 - `s3:GetBucketLocation`
 - `rds:DescribeDBInstances`
 - `sts:GetCallerIdentity`
+
+For scanning organization member accounts, the OrganizationAccountAccessRole (or equivalent) must be present in member accounts.
+
+## Performance
+
+The tool uses Python's multiprocessing to scan regions and accounts in parallel:
+- Number of parallel processes is based on CPU cores
+- Progress tracking across all parallel operations
+- Memory-efficient resource collection
 
 ## License
 

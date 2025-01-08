@@ -3,7 +3,7 @@
 import sys
 from PySide6 import QtWidgets, QtCore, QtGui
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ParamValidationError
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
     QToolBar,
     QFileDialog,
     QDialogButtonBox,
+    QTreeWidget,
+    QTreeWidgetItem,
 )
 import configparser
 import os
@@ -27,6 +29,10 @@ from PySide6.QtCore import QCoreApplication
 from datetime import datetime
 import json
 import pandas as pd
+import re
+from multiprocessing import Pool, cpu_count, Pipe, Process
+from functools import partial
+import time
 
 def get_all_resources(session, progress_dialog=None):
     """
@@ -158,6 +164,258 @@ def get_all_resources(session, progress_dialog=None):
 
     return resources_by_region
 
+def get_organization_accounts(session):
+    """Get all accounts in the organization"""
+    try:
+        org_client = session.client('organizations')
+        accounts = []
+        paginator = org_client.get_paginator('list_accounts')
+        
+        for page in paginator.paginate():
+            accounts.extend(page['Accounts'])
+            
+        return accounts
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'AWSOrganizationsNotInUseException':
+            return []
+        raise e
+
+def can_assume_role(session, account_id, role_name="OrganizationAccountAccessRole"):
+    """Test if we can assume the specified role in the account"""
+    try:
+        sts = session.client('sts')
+        role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+        
+        # Try to assume the role
+        response = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="AWSEnumeratorTest",
+            DurationSeconds=900
+        )
+        return True, response['Credentials']
+    except (ClientError, ParamValidationError) as e:
+        return False, str(e)
+
+def get_session_with_assumed_role(credentials):
+    """Create a new session using assumed role credentials"""
+    return boto3.Session(
+        aws_access_key_id=credentials['AccessKeyId'],
+        aws_secret_access_key=credentials['SecretAccessKey'],
+        aws_session_token=credentials['SessionToken']
+    )
+
+def scan_region(credentials, region, progress_pipe=None):
+    """Scan a single region for resources"""
+    try:
+        if progress_pipe:
+            progress_pipe.send(("debug", f"Starting session creation for {region}"))
+
+        # Create a new session in the worker process
+        if isinstance(credentials, dict):
+            if progress_pipe:
+                progress_pipe.send(("debug", f"Creating session with provided credentials for {region}"))
+            session = boto3.Session(
+                aws_access_key_id=credentials['AccessKeyId'],
+                aws_secret_access_key=credentials['SecretAccessKey'],
+                aws_session_token=credentials.get('SessionToken')
+            )
+        else:
+            if progress_pipe:
+                progress_pipe.send(("debug", f"Creating session from credentials object for {region}"))
+            creds = credentials.get_credentials()
+            session = boto3.Session(
+                aws_access_key_id=creds.access_key,
+                aws_secret_access_key=creds.secret_key,
+                aws_session_token=creds.token
+            )
+
+        if progress_pipe:
+            progress_pipe.send(("status", f"Scanning {region}...", 0))
+
+        region_data = {
+            'Instances': [],
+            'Volumes': [],
+            'Snapshots': [],
+            'SecurityGroups': [],
+            'S3Buckets': [],
+            'RDSInstances': []
+        }
+
+        # EC2 Resources
+        if progress_pipe:
+            progress_pipe.send(("status", f"Checking EC2 resources in {region}...", 20))
+
+        try:
+            ec2 = session.client('ec2', region_name=region)
+            # Instances
+            instances_data = ec2.describe_instances()
+            for reservation in instances_data['Reservations']:
+                for instance in reservation['Instances']:
+                    region_data['Instances'].append(instance['InstanceId'])
+
+            # Volumes
+            volumes_data = ec2.describe_volumes()
+            for volume in volumes_data['Volumes']:
+                region_data['Volumes'].append(volume['VolumeId'])
+
+            # Snapshots
+            snapshots_data = ec2.describe_snapshots(OwnerIds=['self'])
+            for snapshot in snapshots_data['Snapshots']:
+                region_data['Snapshots'].append(snapshot['SnapshotId'])
+
+            # Security Groups
+            sgs_data = ec2.describe_security_groups()
+            for sg in sgs_data['SecurityGroups']:
+                region_data['SecurityGroups'].append(f"{sg['GroupName']} ({sg['GroupId']})")
+
+        except ClientError as e:
+            if progress_pipe:
+                progress_pipe.send(("error", f"Error scanning EC2 in {region}: {str(e)}"))
+
+        # S3 Resources
+        if progress_pipe:
+            progress_pipe.send(("status", f"Checking S3 buckets in {region}...", 60))
+
+        try:
+            # S3 Buckets
+            s3_client = session.client('s3')
+            buckets_data = s3_client.list_buckets()
+            for bucket in buckets_data['Buckets']:
+                bucket_region = s3_client.get_bucket_location(Bucket=bucket['Name'])['LocationConstraint']
+                if bucket_region == region or (bucket_region is None and region == 'us-east-1'):
+                    region_data['S3Buckets'].append(bucket['Name'])
+        except ClientError as e:
+            if progress_pipe:
+                progress_pipe.send(("error", f"Error scanning S3 in {region}: {str(e)}"))
+
+        # RDS Resources
+        if progress_pipe:
+            progress_pipe.send(("status", f"Checking RDS in {region}...", 80))
+
+        try:
+            # RDS Instances
+            rds = session.client('rds', region_name=region)
+            rds_data = rds.describe_db_instances()
+            for db_instance in rds_data['DBInstances']:
+                region_data['RDSInstances'].append(
+                    f"{db_instance['DBInstanceIdentifier']} (Status: {db_instance['DBInstanceStatus']})"
+                )
+        except ClientError as e:
+            if progress_pipe:
+                progress_pipe.send(("error", f"Error scanning RDS in {region}: {str(e)}"))
+
+        if progress_pipe:
+            progress_pipe.send(("status", f"Completed scanning {region}", 100))
+
+        return region, region_data
+
+    except Exception as e:
+        if progress_pipe:
+            progress_pipe.send(("error", f"Error in {region}: {str(e)}"))
+        return region, {}
+
+def scan_account(credentials, regions, progress_callback=None):
+    """Scan an entire account using provided credentials"""
+    print(f"Starting account scan with {len(regions)} regions")
+    if isinstance(credentials, dict) and 'RoleArn' in credentials:
+        print(f"Using role: {credentials['RoleArn']}")
+    
+    # Create pipes for progress updates
+    pipes = [Pipe() for _ in regions]
+    
+    try:
+        # Create pool with processes
+        with Pool(processes=min(cpu_count(), len(regions))) as pool:
+            print(f"Created process pool with {min(cpu_count(), len(regions))} processes")
+            
+            # Start processes with pipes
+            async_results = []
+            for region, (pipe_send, pipe_recv) in zip(regions, pipes):
+                creds = credentials.copy() if isinstance(credentials, dict) else credentials
+                print(f"Starting scan for region: {region}")
+                async_results.append(
+                    pool.apply_async(scan_region, (creds, region, pipe_send))
+                )
+
+            # Monitor progress with timeout
+            completed_regions = 0
+            total_regions = len(regions)
+            while completed_regions < total_regions:
+                # Update overall progress based on completed regions
+                if progress_callback:
+                    overall_progress = (completed_regions / total_regions) * 100
+                    progress_callback(f"Completed {completed_regions}/{total_regions} regions", overall_progress)
+
+                # Check pipes with timeout
+                for pipe_send, pipe_recv in pipes:
+                    if pipe_recv.poll(timeout=0.1):  # Add 100ms timeout
+                        try:
+                            msg_type, *msg_data = pipe_recv.recv()
+                            if msg_type == "status" and progress_callback:
+                                progress_callback(*msg_data)
+                            elif msg_type == "error" and progress_callback:
+                                print(f"Error received: {msg_data[0]}")
+                                progress_callback(f"Error: {msg_data[0]}", 0)
+                            elif msg_type == "debug":
+                                print(f"Debug: {msg_data[0]}")
+                        except EOFError:
+                            print("Pipe closed unexpectedly")
+
+                # Check results with timeout
+                for i, result in enumerate(async_results):
+                    try:
+                        if result.ready():
+                            if not result.successful():
+                                print(f"Region scan failed: {result.get(timeout=1)}")
+                            else:
+                                print(f"Successfully completed region scan {i+1}/{total_regions}")
+                            completed_regions += 1
+                            print(f"Completed regions: {completed_regions}/{total_regions}")
+                    except Exception as e:
+                        print(f"Error checking result: {str(e)}")
+
+                # Add small sleep to prevent CPU spinning
+                QCoreApplication.processEvents()
+                time.sleep(0.05)  # Reduced sleep time for more frequent updates
+
+            print("Getting all results")
+            # Get all results with timeout
+            results = []
+            for i, result in enumerate(async_results):
+                try:
+                    if progress_callback:
+                        progress_callback(
+                            f"Collecting results: {i+1}/{len(async_results)}", 
+                            ((i + 1) / len(async_results)) * 100
+                        )
+                    print(f"Collecting result {i+1}/{len(async_results)}")
+                    region_result = result.get(timeout=30)  # 30 second timeout per region
+                    results.append(region_result)
+                except Exception as e:
+                    print(f"Error collecting result {i+1}: {str(e)}")
+                    results.append((f"region-{i}", {}))  # Add empty result on error
+
+            if progress_callback:
+                progress_callback("Processing collected results...", 100)
+            print("All results collected")
+
+    except Exception as e:
+        print(f"Error in scan_account: {str(e)}")
+        return {}
+    finally:
+        # Clean up pipes
+        for pipe_send, pipe_recv in pipes:
+            pipe_send.close()
+            pipe_recv.close()
+
+    # Combine results into a single dictionary
+    account_data = {}
+    for region, region_data in results:
+        account_data[region] = region_data
+    
+    print(f"Account scan completed with {len(account_data)} regions")
+    return account_data
+
 class AuthDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -256,16 +514,24 @@ class ProgressDialog(QDialog):
         # Create layout
         layout = QVBoxLayout()
 
-        # Overall progress
-        self.overall_label = QLabel("Overall Progress:")
+        # Overall progress (renamed to account overall)
+        self.overall_label = QLabel("Account Overall Progress:")
         layout.addWidget(self.overall_label)
         self.overall_progress = QtWidgets.QProgressBar()
         self.overall_progress.setMinimum(0)
         self.overall_progress.setMaximum(100)
         layout.addWidget(self.overall_progress)
 
-        # Current region progress
-        self.region_label = QLabel("Current Region:")
+        # Current Account progress
+        self.account_label = QLabel("Current Account Progress:")
+        layout.addWidget(self.account_label)
+        self.account_progress = QtWidgets.QProgressBar()
+        self.account_progress.setMinimum(0)
+        self.account_progress.setMaximum(100)
+        layout.addWidget(self.account_progress)
+
+        # Region progress
+        self.region_label = QLabel("Region Progress:")
         layout.addWidget(self.region_label)
         self.region_progress = QtWidgets.QProgressBar()
         self.region_progress.setMinimum(0)
@@ -278,12 +544,24 @@ class ProgressDialog(QDialog):
 
         self.setLayout(layout)
 
-    def update_status(self, message, overall_value, region_value=None):
+    def update_status(self, message, overall_value, region_value=None, account_value=None):
         self.status_label.setText(message)
         self.overall_progress.setValue(overall_value)
         if region_value is not None:
             self.region_progress.setValue(region_value)
+        if account_value is not None:
+            self.account_progress.setValue(account_value)
         # Process events to update the GUI
+        QCoreApplication.processEvents()
+
+    def set_account_label(self, account_id):
+        """Update the overall progress label with the current account ID"""
+        self.overall_label.setText(f"Account {account_id} Overall Progress:")
+        # Reset progress bars and clear message when switching accounts
+        self.overall_progress.setValue(0)
+        self.account_progress.setValue(0)
+        self.region_progress.setValue(0)
+        self.status_label.setText("Starting account scan...")
         QCoreApplication.processEvents()
 
 class ExportDialog(QDialog):
@@ -352,51 +630,169 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_text.setReadOnly(True)
         main_layout.addWidget(self.log_text)
 
-        # Left side: region list
-        self.region_list = QtWidgets.QListWidget()
-        self.region_list.setFixedWidth(200)
-        top_splitter.addWidget(self.region_list)
+        # Left side: account/region tree
+        self.account_tree = QTreeWidget()
+        self.account_tree.setHeaderLabel("Accounts & Regions")
+        self.account_tree.setFixedWidth(300)
+        top_splitter.addWidget(self.account_tree)
 
         # Right side: resources display
         self.resource_display = QtWidgets.QTextEdit()
         self.resource_display.setReadOnly(True)
         top_splitter.addWidget(self.resource_display)
 
-        # Connect region list selection to display update
-        self.region_list.currentItemChanged.connect(self.display_resources_for_region)
+        # Connect tree selection to display update
+        self.account_tree.currentItemChanged.connect(self.display_resources_for_selection)
 
     def initialize_aws(self):
         """Initialize AWS session and fetch resources after GUI is shown"""
         # Authentication
         self.session = self.authenticate()
         if not self.session:
-            sys.exit(0)  # Exit if authentication failed or was cancelled
+            sys.exit(0)
 
         # Create and show progress dialog
         progress = ProgressDialog(self)
         progress.show()
-        QCoreApplication.processEvents()  # Process GUI events
+        QCoreApplication.processEvents()
 
-        # Fetch all resource data from AWS
-        self.resources = get_all_resources(self.session, progress)
+        # Get current account ID and set it in the progress dialog
+        current_account = self.get_account_id()
+        progress.set_account_label(current_account)
 
-        # Close progress dialog
+        try:
+            # Get organization accounts
+            progress.update_status("Checking for organization accounts...", 0, 0, 0)
+            self.accounts = get_organization_accounts(self.session)
+            self.log(f"Found {len(self.accounts)} accounts in the organization")
+        except Exception as e:
+            self.log(f"Error checking organization accounts: {str(e)}")
+            self.accounts = []
+
+        # Initialize resources dictionary
+        self.resources = {}
+        
+        # Get list of regions
+        ec2_client = self.session.client('ec2')
+        regions_data = ec2_client.describe_regions()
+        regions = [r['RegionName'] for r in regions_data['Regions']]
+
+        # Create account items in tree
+        all_accounts_item = QTreeWidgetItem(self.account_tree, ["All Accounts"])
+        self.account_tree.addTopLevelItem(all_accounts_item)
+        
+        # Calculate total number of accounts to process
+        total_accounts = 1 + len(self.accounts)
+        account_progress = 0
+        progress_per_account = 100 / total_accounts
+
+        def progress_callback(progress_dialog):
+            """Create a callback closure with access to the progress dialog"""
+            def callback(message, progress):
+                progress_dialog.update_status(
+                    message, 
+                    int(account_progress), 
+                    progress,  # region progress
+                    int(progress)  # account progress
+                )
+            return callback
+
+        # Process current account
+        current_account = self.get_account_id()
+        progress.set_account_label(current_account)
+        current_account_item = QTreeWidgetItem(all_accounts_item, [f"Account: {current_account} (current)"])
+        
+        # Get credentials from current session
+        creds = self.session.get_credentials()
+        session_creds = {
+            'AccessKeyId': creds.access_key,
+            'SecretAccessKey': creds.secret_key,
+            'SessionToken': creds.token
+        }
+        
+        # Scan current account in parallel
+        self.resources[current_account] = scan_account(
+            session_creds, 
+            regions, 
+            progress_callback(progress)  # Pass the callback closure
+        )
+        
+        # Update progress and tree for current account
+        self.update_account_tree_item(current_account_item, current_account, self.resources[current_account])
+        account_progress += progress_per_account
+        
+        # Process organization accounts
+        if self.accounts:
+            for account in self.accounts:
+                account_id = account['Id']
+                if account_id != current_account:
+                    self.log(f"Starting processing of account {account_id}")
+                    progress.set_account_label(account_id)
+                    
+                    # Try to assume role
+                    self.log(f"Attempting to assume role in account {account_id}")
+                    can_assume, credentials = can_assume_role(self.session, account_id)
+                    
+                    if can_assume:
+                        self.log(f"Successfully assumed role in account {account_id}")
+                        account_item = QTreeWidgetItem(all_accounts_item, 
+                            [f"Account: {account_id} ({account['Name']})"])
+                        
+                        # Use the credentials we got from assume_role directly
+                        # No need to add RoleArn as we've already assumed the role
+                        
+                        # Scan account in parallel
+                        self.log(f"Starting parallel scan of account {account_id}")
+                        self.resources[account_id] = scan_account(
+                            credentials,  # Use the credentials directly
+                            regions,
+                            progress_callback(progress)
+                        )
+                        self.log(f"Completed parallel scan of account {account_id}")
+                        
+                        self.update_account_tree_item(account_item, account_id, self.resources[account_id])
+                    else:
+                        self.log(f"Cannot assume role in account {account_id}: {credentials}")
+                        account_item = QTreeWidgetItem(all_accounts_item, 
+                            [f"Account: {account_id} ({account['Name']}) - Access Denied"])
+                        account_item.setToolTip(0, f"Cannot assume role: {credentials}")
+                
+                account_progress += progress_per_account
+                self.log(f"Completed processing of account {account_id}")
+
+        # Calculate and update grand total
+        grand_total = self.calculate_grand_total()
+        all_accounts_item.setText(0, f"All Accounts ({grand_total} total resources)")
+
+        # Expand the tree and clean up
+        self.account_tree.expandAll()
         progress.close()
+        self.log("AWS Enumerator initialized. Select an account/region to see its resources.")
 
-        # Calculate total resources for ALL regions
-        all_resources_count = 0
-        for region, data in self.resources.items():
+    def update_account_tree_item(self, account_item, account_id, account_data):
+        """Update tree item with account resource information"""
+        total_account_resources = 0
+        for region, data in account_data.items():
             if region != 'ALL':
                 region_count = sum(len(resources) for resources in data.values())
-                all_resources_count += region_count
-                # Add region with resource count to the list
-                self.region_list.addItem(f"{region} ({region_count} resources)")
+                total_account_resources += region_count
+                QTreeWidgetItem(account_item, [f"{region} ({region_count} resources)"])
+        
+        # Update account text with total resources
+        name = account_item.text(0).split(" - ")[0]  # Keep existing name/description
+        account_item.setText(0, f"{name} - {total_account_resources} total resources")
+        
+        # Add "All Regions" under account
+        QTreeWidgetItem(account_item, [f"All Regions ({total_account_resources} resources)"])
 
-        # Add ALL option at the top with total resource count
-        self.region_list.insertItem(0, f"ALL ({all_resources_count} resources)")
-
-        # Initial log message
-        self.log("AWS Enumerator initialized. Select a region on the left to see its resources.")
+    def calculate_grand_total(self):
+        """Calculate total resources across all accounts"""
+        grand_total = 0
+        for account_data in self.resources.values():
+            for region_data in account_data.values():
+                if isinstance(region_data, dict):  # Ensure it's a region data dictionary
+                    grand_total += sum(len(resources) for resources in region_data.values())
+        return grand_total
 
     def authenticate(self):
         auth_dialog = AuthDialog(self)
@@ -438,37 +834,64 @@ class MainWindow(QtWidgets.QMainWindow):
             config.write(configfile)
         self.log(f"API Key stored under profile '{profile_name}'.")
 
-    def display_resources_for_region(self, current, previous):
+    def display_resources_for_selection(self, current, previous):
         if not current:
             return
 
-        # Extract region name from the list item text (remove the resource count)
-        region = current.text().split(" (")[0]
+        item_text = current.text(0)
         
-        if region == "ALL":
-            # Combine data for all regions
-            combined = {
-                'Instances': [],
-                'Volumes': [],
-                'Snapshots': [],
-                'SecurityGroups': [],
-                'S3Buckets': [],
-                'RDSInstances': []
-            }
-            for r, region_data in self.resources.items():
-                if r == "ALL":
-                    continue
-                for key in combined:
-                    combined[key].extend(region_data[key])
+        # Check if this is an account selection
+        if item_text.startswith("Account:"):
+            account_id = item_text.split()[1]
+            if account_id not in self.resources:
+                self.resource_display.clear()
+                self.resource_display.append(f"Switch to account {account_id} to view its resources")
+                return
+        
+        # Check if this is a region selection
+        region_match = re.match(r"([a-z]{2}-[a-z]+-\d+)\s+\(", item_text)
+        if region_match:
+            region = region_match.group(1)
+            account_id = self.get_account_from_item(current)
+            if account_id in self.resources:
+                region_data = self.resources[account_id].get(region, {})
+                self.resource_display.clear()
+                self.resource_display.append(self.format_region_data(region, region_data))
+        
+        # Check if this is "All Regions" for an account
+        if item_text.startswith("All Regions"):
+            account_id = self.get_account_from_item(current)
+            if account_id in self.resources:
+                combined = self.combine_all_regions(account_id)
+                self.resource_display.clear()
+                self.resource_display.append(self.format_region_data("ALL", combined))
 
-            self.log(f"Displaying resources for ALL regions.")
-            self.resource_display.clear()
-            self.resource_display.append(self.format_region_data("ALL", combined))
-        else:
-            region_data = self.resources.get(region, {})
-            self.log(f"Displaying resources for region {region}.")
-            self.resource_display.clear()
-            self.resource_display.append(self.format_region_data(region, region_data))
+    def get_account_from_item(self, item):
+        """Get account ID from a tree item by walking up to its account parent"""
+        while item:
+            if item.text(0).startswith("Account:"):
+                return item.text(0).split()[1]
+            item = item.parent()
+        return None
+
+    def combine_all_regions(self, account_id):
+        """Helper method to combine resources from all regions for a specific account"""
+        combined = {
+            'Instances': [],
+            'Volumes': [],
+            'Snapshots': [],
+            'SecurityGroups': [],
+            'S3Buckets': [],
+            'RDSInstances': []
+        }
+        
+        if account_id in self.resources:
+            for region, region_data in self.resources[account_id].items():
+                if region != "ALL":
+                    for key in combined:
+                        combined[key].extend(region_data[key])
+        
+        return combined
 
     def format_region_data(self, region, data_dict):
         lines = [f"Resources in region: {region}\n"]
@@ -568,67 +991,60 @@ class MainWindow(QtWidgets.QMainWindow):
         with pd.ExcelWriter(file_path) as writer:
             # Create summary sheet
             summary_data = {
+                'Account': [],
                 'Region': [],
                 'Resource Type': [],
                 'Count': []
             }
             
-            # Add ALL regions summary
-            all_resources = self.combine_all_regions()
-            for resource_type, items in all_resources.items():
-                summary_data['Region'].append('ALL')
-                summary_data['Resource Type'].append(resource_type)
-                summary_data['Count'].append(len(items))
+            has_data = False
+            # Add data for each account
+            for account_id, account_resources in self.resources.items():
+                # Add individual region summaries
+                for region, region_data in account_resources.items():
+                    if region != "ALL":
+                        for resource_type, items in region_data.items():
+                            summary_data['Account'].append(account_id)
+                            summary_data['Region'].append(region)
+                            summary_data['Resource Type'].append(resource_type)
+                            summary_data['Count'].append(len(items))
+                            has_data = True
             
-            # Add individual region summaries
-            for region in sorted(self.resources.keys()):
-                if region != "ALL":
-                    for resource_type, items in self.resources[region].items():
-                        summary_data['Region'].append(region)
-                        summary_data['Resource Type'].append(resource_type)
-                        summary_data['Count'].append(len(items))
-            
+            # Always create summary sheet
             pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
             
             # Create detailed sheets for each resource type
             resource_types = ['Instances', 'Volumes', 'Snapshots', 'SecurityGroups', 'S3Buckets', 'RDSInstances']
             
+            has_detailed_sheets = False
             for resource_type in resource_types:
                 resource_data = {
+                    'Account': [],
                     'Region': [],
                     'Resource': []
                 }
                 
-                for region in sorted(self.resources.keys()):
-                    if region != "ALL":
-                        for resource in self.resources[region][resource_type]:
-                            resource_data['Region'].append(region)
-                            resource_data['Resource'].append(resource)
+                # Collect data from all accounts and regions
+                for account_id, account_resources in self.resources.items():
+                    for region, region_data in account_resources.items():
+                        if region != "ALL" and resource_type in region_data:
+                            for resource in region_data[resource_type]:
+                                resource_data['Account'].append(account_id)
+                                resource_data['Region'].append(region)
+                                resource_data['Resource'].append(resource)
                 
-                if resource_data['Region']:  # Only create sheet if there's data
-                    pd.DataFrame(resource_data).to_excel(
-                        writer,
-                        sheet_name=resource_type[:31],  # Excel sheet names limited to 31 chars
-                        index=False
-                    )
-
-    def combine_all_regions(self):
-        """Helper method to combine resources from all regions"""
-        combined = {
-            'Instances': [],
-            'Volumes': [],
-            'Snapshots': [],
-            'SecurityGroups': [],
-            'S3Buckets': [],
-            'RDSInstances': []
-        }
-        
-        for region, region_data in self.resources.items():
-            if region != "ALL":
-                for key in combined:
-                    combined[key].extend(region_data[key])
-        
-        return combined
+                # Only create sheet if we found data for this resource type
+                if len(resource_data['Account']) > 0:
+                    df = pd.DataFrame(resource_data)
+                    sheet_name = resource_type[:31]  # Excel sheet names limited to 31 chars
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    has_detailed_sheets = True
+            
+            # If no data at all, add an empty "Details" sheet
+            if not has_data and not has_detailed_sheets:
+                pd.DataFrame({
+                    'Note': ['No resources found in any account/region']
+                }).to_excel(writer, sheet_name='Details', index=False)
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
