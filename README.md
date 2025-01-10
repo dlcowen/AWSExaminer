@@ -46,25 +46,23 @@ A Python-based GUI tool for enumerating and analyzing AWS resources across multi
     - Instances
     - Databases
     - Load Balancers
-- Real-time progress tracking:
-  - Overall account progress
-  - Current account progress
-  - Region-specific progress
-- Multiple authentication methods:
-  - AWS Profile
-  - Direct API Key input
-- Export capabilities:
-  - Text format (as displayed)
-  - JSON format
-  - Excel spreadsheet (with summary and detailed sheets)
-- Multi-processing support:
-  - Parallel region scanning
-  - Concurrent account processing
-  - Progress tracking across all operations
-- Enhanced data visualization:
-  - Color-coded status indicators
-  - Hierarchical resource views
-  - Detailed metadata display
+  - Lambda Functions:
+    - Runtime and memory configuration
+    - Timeout settings
+    - VPC configuration
+    - Layer usage
+    - Environment variables
+    - State and modifications
+  - Gateways:
+    - Internet Gateways:
+      - VPC attachments
+      - State information
+      - Tags
+    - NAT Gateways:
+      - Type (public/private)
+      - IP addresses
+      - VPC and subnet
+      - State information
 
 ## Installation
 
@@ -145,6 +143,10 @@ The AWS credentials used should have the following permissions:
 - `lightsail:GetInstances`
 - `lightsail:GetRelationalDatabases`
 - `lightsail:GetLoadBalancers`
+- `lambda:ListFunctions`
+- `lambda:GetFunctionConfiguration`
+- `ec2:DescribeInternetGateways`
+- `ec2:DescribeNatGateways`
 
 For scanning organization member accounts, the OrganizationAccountAccessRole (or equivalent) must be present in member accounts.
 

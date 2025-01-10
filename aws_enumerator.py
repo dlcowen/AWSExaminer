@@ -136,7 +136,8 @@ def get_all_resources(session, progress_dialog=None):
             'SecurityGroups': [],
             'S3Buckets': [],
             'RDSInstances': [],
-            'CloudTrails': []
+            'CloudTrails': [],
+            'LambdaFunctions': []
         }
 
         # EC2 Resources (50% of region progress)
@@ -266,6 +267,33 @@ def get_all_resources(session, progress_dialog=None):
             if progress_dialog:
                 progress_dialog.update_status(f"Error scanning CloudTrail in {region}: {str(e)}", 
                                            100, 100)
+
+        # Lambda Functions
+        try:
+            progress_pipe.send(("status", f"Scanning Lambda functions in {region}", 98))
+            lambda_functions = get_lambda_functions(session, region)
+            for func in lambda_functions:
+                formatted_function = (
+                    f"{func['Name']}:\n"
+                    f"    Runtime: {func['Runtime']}\n"
+                    f"    Memory: {func['Memory']}\n"
+                    f"    Timeout: {func['Timeout']}\n"
+                    f"    State: {func['State']}\n"
+                    f"    Handler: {func['Handler']}\n"
+                    f"    Last Modified: {func['LastModified']}\n"
+                    f"    VPC Config: {'Yes' if func['VpcConfig'] else 'No'}\n"
+                    f"    Layers: {func['LayersCount']}\n"
+                    f"    Environment Variables: {'Yes' if func['EnvVars'] else 'No'}"
+                )
+                if func['Description']:
+                    formatted_function += f"\n    Description: {func['Description']}"
+                if func['StateReason']:
+                    formatted_function += f"\n    State Reason: {func['StateReason']}"
+                
+                region_data['LambdaFunctions'].append(formatted_function)
+
+        except Exception as e:
+            progress_pipe.send(("error", f"Lambda functions scan failed in {region}: {str(e)}"))
 
         resources_by_region[region] = region_data
         current_progress += progress_per_region
@@ -484,7 +512,11 @@ def scan_region(credentials, region, progress_pipe=None):
             'LightsailInstances': [],
             'LightsailDatabases': [],
             'LightsailLoadBalancers': [],
-            'VPCFlowLogs': []
+            'VPCFlowLogs': [],
+            'LambdaFunctions': [],
+            'InternetGateways': [],
+            'NATGateways': [],
+            'NetworkACLs': []
         }
 
         # EC2 Resources
@@ -705,6 +737,73 @@ def scan_region(credentials, region, progress_pipe=None):
 
         except Exception as e:
             progress_pipe.send(("error", f"VPC Flow Logs scan failed in {region}: {str(e)}"))
+
+        # Lambda Functions
+        try:
+            progress_pipe.send(("status", f"Scanning Lambda functions in {region}", 98))
+            lambda_functions = get_lambda_functions(session, region)
+            for func in lambda_functions:
+                formatted_function = (
+                    f"{func['Name']}:\n"
+                    f"    Runtime: {func['Runtime']}\n"
+                    f"    Memory: {func['Memory']}\n"
+                    f"    Timeout: {func['Timeout']}\n"
+                    f"    State: {func['State']}\n"
+                    f"    Handler: {func['Handler']}\n"
+                    f"    Last Modified: {func['LastModified']}\n"
+                    f"    VPC Config: {'Yes' if func['VpcConfig'] else 'No'}\n"
+                    f"    Layers: {func['LayersCount']}\n"
+                    f"    Environment Variables: {'Yes' if func['EnvVars'] else 'No'}"
+                )
+                if func['Description']:
+                    formatted_function += f"\n    Description: {func['Description']}"
+                if func['StateReason']:
+                    formatted_function += f"\n    State Reason: {func['StateReason']}"
+                
+                region_data['LambdaFunctions'].append(formatted_function)
+
+        except Exception as e:
+            progress_pipe.send(("error", f"Lambda functions scan failed in {region}: {str(e)}"))
+
+        # Gateway Resources
+        try:
+            progress_pipe.send(("status", f"Scanning Gateways in {region}", 96))
+            internet_gateways, nat_gateways = get_gateway_info(session, region)
+            
+            # Format Internet Gateways
+            for igw in internet_gateways:
+                name = igw['Tags'].get('Name', 'Unnamed')
+                formatted_igw = (
+                    f"{igw['Id']} ({name}):\n"
+                    f"    State: {igw['State']}\n"
+                    f"    Attached VPCs: {', '.join(igw['VPCs']) if igw['VPCs'] else 'None'}"
+                )
+                region_data['InternetGateways'].append(formatted_igw)
+            
+            # Format NAT Gateways
+            for nat in nat_gateways:
+                name = nat['Tags'].get('Name', 'Unnamed')
+                formatted_nat = (
+                    f"{nat['Id']} ({name}):\n"
+                    f"    State: {nat['State']}\n"
+                    f"    Type: {nat['Type']}\n"
+                    f"    VPC: {nat['VpcId']}\n"
+                    f"    Subnet: {nat['SubnetId']}\n"
+                    f"    Public IP: {nat['PublicIP']}\n"
+                    f"    Private IP: {nat['PrivateIP']}"
+                )
+                region_data['NATGateways'].append(formatted_nat)
+
+        except Exception as e:
+            progress_pipe.send(("error", f"Gateway scan failed in {region}: {str(e)}"))
+
+        # Network ACLs
+        try:
+            progress_pipe.send(("status", f"Scanning Network ACLs in {region}", 97))
+            network_acls = get_network_acls(session, region)
+            region_data['NetworkACLs'].extend(network_acls)
+        except Exception as e:
+            progress_pipe.send(("error", f"Network ACL scan failed in {region}: {str(e)}"))
 
         progress_pipe.send(("status", f"Completed scanning {region}", 100))
         return region, region_data
@@ -1210,6 +1309,153 @@ class VPCFlowLogsTab(QtWidgets.QWidget):
         
         self.flow_logs_tree.expandAll()
 
+class NetworkSecurityTab(QtWidgets.QWidget):
+    """Tab for analyzing network security configurations across accounts"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+    
+    def _setup_ui(self):
+        """Initialize the UI components"""
+        layout = QVBoxLayout()
+        
+        # Tree widget for network security analysis
+        self.security_tree = QTreeWidget()
+        self.security_tree.setHeaderLabels([
+            "Account/VPC/Subnet",
+            "Resource",
+            "Direction",
+            "Protocol",
+            "Ports",
+            "Source/Destination",
+            "Description"
+        ])
+        
+        # Set column widths
+        self.security_tree.setColumnWidth(0, 200)  # Account/VPC/Subnet
+        self.security_tree.setColumnWidth(1, 150)  # Resource
+        self.security_tree.setColumnWidth(2, 100)  # Direction
+        self.security_tree.setColumnWidth(3, 100)  # Protocol
+        self.security_tree.setColumnWidth(4, 150)  # Ports
+        self.security_tree.setColumnWidth(5, 200)  # Source/Dest
+        self.security_tree.setColumnWidth(6, 300)  # Description
+        
+        layout.addWidget(self.security_tree)
+        self.setLayout(layout)
+    
+    def update_security_analysis(self, resources):
+        """Update the tree with network security analysis"""
+        self.security_tree.clear()
+        
+        for account_id, account_data in resources.items():
+            account_item = QTreeWidgetItem(self.security_tree)
+            account_item.setText(0, f"Account: {account_id}")
+            
+            # Analyze security groups and network ACLs by VPC
+            vpc_rules = self._analyze_vpc_security(account_data)
+            
+            for vpc_id, vpc_info in vpc_rules.items():
+                vpc_item = QTreeWidgetItem(account_item)
+                vpc_item.setText(0, f"VPC: {vpc_id}")
+                
+                # Security Groups
+                if vpc_info['security_groups']:
+                    sg_parent = QTreeWidgetItem(vpc_item)
+                    sg_parent.setText(0, "Security Groups")
+                    
+                    for sg in vpc_info['security_groups']:
+                        self._add_security_group_rules(sg_parent, sg)
+                
+                # Network ACLs
+                if vpc_info['network_acls']:
+                    nacl_parent = QTreeWidgetItem(vpc_item)
+                    nacl_parent.setText(0, "Network ACLs")
+                    
+                    for nacl in vpc_info['network_acls']:
+                        self._add_nacl_rules(nacl_parent, nacl)
+        
+        self.security_tree.expandToDepth(1)
+    
+    def _analyze_vpc_security(self, account_data):
+        """Analyze security configurations for each VPC"""
+        vpc_rules = {}
+        
+        for region, region_data in account_data.items():
+            if region == "ALL":
+                continue
+            
+            # Get security groups
+            for sg_text in region_data.get('SecurityGroups', []):
+                # Parse security group text to get VPC ID and rules
+                sg_info = self._parse_security_group_text(sg_text)
+                if sg_info:
+                    vpc_id = sg_info['VpcId']
+                    if vpc_id not in vpc_rules:
+                        vpc_rules[vpc_id] = {
+                            'security_groups': [],
+                            'network_acls': []
+                        }
+                    vpc_rules[vpc_id]['security_groups'].append(sg_info)
+            
+            # Get network ACLs
+            for nacl in region_data.get('NetworkACLs', []):
+                vpc_id = nacl['VpcId']
+                if vpc_id not in vpc_rules:
+                    vpc_rules[vpc_id] = {
+                        'security_groups': [],
+                        'network_acls': []
+                    }
+                vpc_rules[vpc_id]['network_acls'].append(nacl)
+        
+        return vpc_rules
+    
+    def _parse_security_group_text(self, sg_text):
+        """Parse security group text to extract rules"""
+        try:
+            lines = sg_text.split('\n')
+            name_id = lines[0].split(' (')
+            group_name = name_id[0]
+            group_id = name_id[1].rstrip(')')
+            
+            return {
+                'GroupName': group_name,
+                'GroupId': group_id,
+                'VpcId': 'vpc-unknown',  # You might need to modify your security group data to include VPC ID
+                'InboundRules': [],
+                'OutboundRules': []
+            }
+        except Exception:
+            return None
+    
+    def _add_security_group_rules(self, parent, sg):
+        """Add security group rules to the tree"""
+        sg_item = QTreeWidgetItem(parent)
+        sg_item.setText(0, sg['GroupName'])
+        sg_item.setText(1, "Security Group")
+        
+        # Add placeholder for rules
+        rule_item = QTreeWidgetItem(sg_item)
+        rule_item.setText(2, "See Security Groups tab for details")
+    
+    def _add_nacl_rules(self, parent, nacl):
+        """Add network ACL rules to the tree"""
+        nacl_item = QTreeWidgetItem(parent)
+        nacl_item.setText(0, nacl['NetworkAclId'])
+        nacl_item.setText(1, "Network ACL")
+        
+        for rule in nacl['Rules']:
+            rule_item = QTreeWidgetItem(nacl_item)
+            rule_item.setText(2, rule['Type'])
+            rule_item.setText(3, rule['Protocol'])
+            rule_item.setText(4, rule['Ports'])
+            rule_item.setText(5, rule['CidrBlock'])
+            rule_item.setText(6, f"Rule #{rule['RuleNumber']} - {rule['Action']}")
+            
+            if rule['Action'] == 'allow' and (rule['Protocol'] == 'ALL' or rule['Ports'] == 'ALL'):
+                for i in range(7):
+                    rule_item.setBackground(i, QtGui.QColor("#ffe6e6"))
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1271,6 +1517,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Connect tree selection to display update
         self.account_tree.currentItemChanged.connect(self.display_resources_for_selection)
+
+        # Add Network Security tab
+        self.network_security_tab = NetworkSecurityTab()
+        self.tab_widget.addTab(self.network_security_tab, "Network Security")
 
     def initialize_aws(self):
         """Initialize AWS session and fetch resources after GUI is shown"""
@@ -1527,7 +1777,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'S3Buckets': [],
             'RDSInstances': [],
             'CloudTrails': [],
-            'CloudWatchLogs': []  # Add CloudWatch Logs
+            'CloudWatchLogs': [],
+            'LambdaFunctions': []
         }
         
         if account_id in self.resources:
@@ -1832,6 +2083,58 @@ class MainWindow(QtWidgets.QMainWindow):
                         df.to_excel(writer, sheet_name='EC2 Snapshots', index=False)
                         has_detailed_sheets = True
                 
+                elif resource_type == 'LambdaFunctions':
+                    # Special handling for Lambda functions
+                    resource_data = {
+                        'Account': [],
+                        'Region': [],
+                        'Function Name': [],
+                        'Runtime': [],
+                        'Memory': [],
+                        'Timeout': [],
+                        'State': [],
+                        'Handler': [],
+                        'Last Modified': [],
+                        'VPC Config': [],
+                        'Layers Count': [],
+                        'Has Env Vars': [],
+                        'Description': []
+                    }
+                    
+                    for account_id, account_resources in self.resources.items():
+                        for region, region_data in account_resources.items():
+                            if region != "ALL" and resource_type in region_data:
+                                for function_text in region_data[resource_type]:
+                                    # Parse the formatted function text
+                                    lines = function_text.split('\n')
+                                    function_name = lines[0].rstrip(':')
+                                    
+                                    # Extract fields
+                                    fields = {}
+                                    for line in lines[1:]:
+                                        if ':' in line:
+                                            key, value = line.strip().split(': ', 1)
+                                            fields[key.strip()] = value
+                                    
+                                    resource_data['Account'].append(account_id)
+                                    resource_data['Region'].append(region)
+                                    resource_data['Function Name'].append(function_name)
+                                    resource_data['Runtime'].append(fields.get('Runtime', ''))
+                                    resource_data['Memory'].append(fields.get('Memory', ''))
+                                    resource_data['Timeout'].append(fields.get('Timeout', ''))
+                                    resource_data['State'].append(fields.get('State', ''))
+                                    resource_data['Handler'].append(fields.get('Handler', ''))
+                                    resource_data['Last Modified'].append(fields.get('Last Modified', ''))
+                                    resource_data['VPC Config'].append(fields.get('VPC Config', ''))
+                                    resource_data['Layers Count'].append(fields.get('Layers', '0'))
+                                    resource_data['Has Env Vars'].append(fields.get('Environment Variables', ''))
+                                    resource_data['Description'].append(fields.get('Description', ''))
+                    
+                    if len(resource_data['Account']) > 0:
+                        df = pd.DataFrame(resource_data)
+                        df.to_excel(writer, sheet_name='Lambda Functions', index=False)
+                        has_detailed_sheets = True
+                
                 else:
                     # Standard handling for other resources
                     resource_data = {
@@ -1860,6 +2163,94 @@ class MainWindow(QtWidgets.QMainWindow):
                 pd.DataFrame({
                     'Note': ['No resources found in any account/region']
                 }).to_excel(writer, sheet_name='Details', index=False)
+
+            elif resource_type == 'InternetGateways':
+                resource_data = {
+                    'Account': [],
+                    'Region': [],
+                    'Gateway ID': [],
+                    'Name': [],
+                    'State': [],
+                    'Attached VPCs': []
+                }
+                
+                for account_id, account_resources in self.resources.items():
+                    for region, region_data in account_resources.items():
+                        if region != "ALL" and resource_type in region_data:
+                            for igw_text in region_data[resource_type]:
+                                lines = igw_text.split('\n')
+                                id_name = lines[0].split(' (')
+                                gateway_id = id_name[0]
+                                name = id_name[1].rstrip('):')
+                                
+                                fields = {}
+                                for line in lines[1:]:
+                                    if ':' in line:
+                                        key, value = line.strip().split(': ', 1)
+                                        fields[key.strip()] = value
+                                
+                                resource_data['Account'].append(account_id)
+                                resource_data['Region'].append(region)
+                                resource_data['Gateway ID'].append(gateway_id)
+                                resource_data['Name'].append(name)
+                                resource_data['State'].append(fields.get('State', ''))
+                                resource_data['Attached VPCs'].append(fields.get('Attached VPCs', ''))
+                
+                if len(resource_data['Account']) > 0:
+                    df = pd.DataFrame(resource_data)
+                    df.to_excel(writer, sheet_name='Internet Gateways', index=False)
+                    has_detailed_sheets = True
+
+            elif resource_type == 'NATGateways':
+                resource_data = {
+                    'Account': [],
+                    'Region': [],
+                    'Gateway ID': [],
+                    'Name': [],
+                    'State': [],
+                    'Type': [],
+                    'VPC': [],
+                    'Subnet': [],
+                    'Public IP': [],
+                    'Private IP': []
+                }
+                
+                for account_id, account_resources in self.resources.items():
+                    for region, region_data in account_resources.items():
+                        if region != "ALL" and resource_type in region_data:
+                            for nat_text in region_data[resource_type]:
+                                lines = nat_text.split('\n')
+                                id_name = lines[0].split(' (')
+                                gateway_id = id_name[0]
+                                name = id_name[1].rstrip('):')
+                                
+                                fields = {}
+                                for line in lines[1:]:
+                                    if ':' in line:
+                                        key, value = line.strip().split(': ', 1)
+                                        fields[key.strip()] = value
+                                
+                                resource_data['Account'].append(account_id)
+                                resource_data['Region'].append(region)
+                                resource_data['Gateway ID'].append(gateway_id)
+                                resource_data['Name'].append(name)
+                                resource_data['State'].append(fields.get('State', ''))
+                                resource_data['Type'].append(fields.get('Type', ''))
+                                resource_data['VPC'].append(fields.get('VPC', ''))
+                                resource_data['Subnet'].append(fields.get('Subnet', ''))
+                                resource_data['Public IP'].append(fields.get('Public IP', ''))
+                                resource_data['Private IP'].append(fields.get('Private IP', ''))
+                
+                if len(resource_data['Account']) > 0:
+                    df = pd.DataFrame(resource_data)
+                    df.to_excel(writer, sheet_name='NAT Gateways', index=False)
+                    has_detailed_sheets = True
+
+    def update_resources(self, resources):
+        # ... (existing update code) ...
+        
+        # Update Network Security tab
+        self.network_security_tab.update_security_analysis(resources)
 
 def get_vpc_flow_logs_info(session, region):
     """
@@ -1934,6 +2325,160 @@ def get_vpc_flow_logs_info(session, region):
         return flow_logs
     except Exception as e:
         print(f"Error getting VPC Flow Logs info in {region}: {str(e)}")
+        return []
+
+def get_lambda_functions(session, region):
+    """
+    Get Lambda functions in a region.
+    
+    Args:
+        session (boto3.Session): AWS session
+        region (str): AWS region name
+    
+    Returns:
+        list: List of dictionaries containing Lambda function details:
+            - Name: Function name
+            - Runtime: Language/runtime
+            - Memory: Configured memory
+            - Timeout: Function timeout
+            - LastModified: Last update time
+            - State: Current state
+    """
+    try:
+        lambda_client = create_client_with_retries(session, 'lambda', region)
+        functions = []
+        
+        paginator = lambda_client.get_paginator('list_functions')
+        for page in paginator.paginate():
+            for function in page['Functions']:
+                # Get function configuration
+                try:
+                    config = lambda_client.get_function_configuration(
+                        FunctionName=function['FunctionName']
+                    )
+                    
+                    functions.append({
+                        'Name': function['FunctionName'],
+                        'Runtime': function.get('Runtime', 'Unknown'),
+                        'Memory': f"{function.get('MemorySize', 'Unknown')} MB",
+                        'Timeout': f"{function.get('Timeout', 'Unknown')} seconds",
+                        'LastModified': function.get('LastModified', 'Unknown'),
+                        'State': config.get('State', 'Unknown'),
+                        'StateReason': config.get('StateReason', ''),
+                        'Handler': function.get('Handler', 'Unknown'),
+                        'Description': function.get('Description', ''),
+                        'VpcConfig': bool(function.get('VpcConfig', {})),
+                        'LayersCount': len(function.get('Layers', [])),
+                        'EnvVars': bool(function.get('Environment', {}).get('Variables', {}))
+                    })
+                except Exception as e:
+                    print(f"Error getting function configuration for {function['FunctionName']}: {str(e)}")
+        
+        return functions
+    except Exception as e:
+        print(f"Error getting Lambda functions in {region}: {str(e)}")
+        return []
+
+def get_gateway_info(session, region):
+    """
+    Get Internet and NAT Gateway information for a region.
+    
+    Args:
+        session (boto3.Session): AWS session
+        region (str): AWS region name
+    
+    Returns:
+        tuple: Lists of Internet and NAT Gateway details
+    """
+    try:
+        ec2 = create_client_with_retries(session, 'ec2', region)
+        internet_gateways = []
+        nat_gateways = []
+        
+        # Get Internet Gateways
+        igw_paginator = ec2.get_paginator('describe_internet_gateways')
+        for page in igw_paginator.paginate():
+            for igw in page['InternetGateways']:
+                attachments = igw.get('Attachments', [])
+                vpc_ids = [att['VpcId'] for att in attachments if att['State'] == 'available']
+                
+                gateway_info = {
+                    'Id': igw['InternetGatewayId'],
+                    'VPCs': vpc_ids,
+                    'State': 'Available' if vpc_ids else 'Detached',
+                    'Tags': {tag['Key']: tag['Value'] for tag in igw.get('Tags', [])}
+                }
+                internet_gateways.append(gateway_info)
+        
+        # Get NAT Gateways
+        nat_paginator = ec2.get_paginator('describe_nat_gateways')
+        for page in nat_paginator.paginate():
+            for nat in page['NatGateways']:
+                nat_info = {
+                    'Id': nat['NatGatewayId'],
+                    'VpcId': nat['VpcId'],
+                    'SubnetId': nat['SubnetId'],
+                    'State': nat['State'],
+                    'Type': nat.get('ConnectivityType', 'public'),
+                    'PublicIP': next((addr['PublicIp'] for addr in nat.get('NatGatewayAddresses', [])), 'N/A'),
+                    'PrivateIP': next((addr['PrivateIp'] for addr in nat.get('NatGatewayAddresses', [])), 'N/A'),
+                    'Tags': {tag['Key']: tag['Value'] for tag in nat.get('Tags', [])}
+                }
+                nat_gateways.append(nat_info)
+        
+        return internet_gateways, nat_gateways
+    except Exception as e:
+        print(f"Error getting gateway info in {region}: {str(e)}")
+        return [], []
+
+def get_network_acls(session, region):
+    """Get Network ACLs in a region"""
+    try:
+        ec2 = create_client_with_retries(session, 'ec2', region)
+        acls = []
+        
+        paginator = ec2.get_paginator('describe_network_acls')
+        for page in paginator.paginate():
+            for nacl in page['NetworkAcls']:
+                nacl_info = {
+                    'NetworkAclId': nacl['NetworkAclId'],
+                    'VpcId': nacl['VpcId'],
+                    'IsDefault': nacl['IsDefault'],
+                    'Rules': []
+                }
+                
+                # Process inbound and outbound rules
+                for entry in nacl['Entries']:
+                    port_range = entry.get('PortRange', {})
+                    from_port = port_range.get('From', 0)
+                    to_port = port_range.get('To', 0)
+                    
+                    rule = {
+                        'RuleNumber': entry['RuleNumber'],
+                        'Protocol': entry.get('Protocol', '-1'),
+                        'Type': 'Inbound' if not entry['Egress'] else 'Outbound',
+                        'Action': entry['RuleAction'],
+                        'CidrBlock': entry.get('CidrBlock', ''),
+                        'Ports': f"{from_port}-{to_port}" if from_port != to_port else str(from_port)
+                    }
+                    
+                    # Format protocol
+                    if rule['Protocol'] == '-1':
+                        rule['Protocol'] = 'ALL'
+                    elif rule['Protocol'] == '6':
+                        rule['Protocol'] = 'TCP'
+                    elif rule['Protocol'] == '17':
+                        rule['Protocol'] = 'UDP'
+                    elif rule['Protocol'] == '1':
+                        rule['Protocol'] = 'ICMP'
+                    
+                    nacl_info['Rules'].append(rule)
+                
+                acls.append(nacl_info)
+        
+        return acls
+    except Exception as e:
+        print(f"Error getting Network ACLs in {region}: {str(e)}")
         return []
 
 def main():
